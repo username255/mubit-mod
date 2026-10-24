@@ -50,18 +50,29 @@ const TRACES = JSON.stringify([
   },
 ])
 
+const PROJECTS = JSON.stringify({
+  projects: [
+    { slug: 'ws-aaa', name: 'mubit-hack', status: 'healthy' },
+    { slug: 'ws-bbb', name: 'clean-project', status: 'new' },
+  ],
+})
+const METRICS = JSON.stringify({ totals: { calls: 320, errors: 0, p50_ms: 1272 } })
+const POLICY = JSON.stringify({ effective: { promotion: { min_pairs: 50, bar: 0.9 } } })
+
+const stdoutFor = (argv: readonly string[]) =>
+  argv.includes('traces') ? TRACES
+  : argv.includes('rate') ? '{"feedback_count":1}'
+  : argv.includes('projects') ? PROJECTS
+  : argv.includes('metrics') ? METRICS
+  : argv.includes('policy') ? POLICY
+  : TASKS
+
 const wire = (on: any) => {
   on('command.register', () => ({ value: { command: 'mubit' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('process.run', (_: unknown, e: { argv: readonly string[] }) => ({
-    value: {
-      exitCode: 0,
-      stdout: e.argv.includes('traces') ? TRACES : e.argv.includes('rate') ? '{"feedback_count":1}' : TASKS,
-      stderr: '',
-      isStdoutTruncated: false,
-      isStderrTruncated: false,
-    },
+    value: { exitCode: 0, stdout: stdoutFor(e.argv), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
   }))
 }
 
@@ -74,6 +85,21 @@ test('tasks view shows stats and the shadow meter', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /Decide whether number/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /308 calls/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /shadow 7\/13/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /p50 1272ms/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('projects view lists projects and switches the active one', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'projects' })
+
+  expect(await ui.find({ type: 'Text', text: /clean-project/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /console default/ })).toBeDefined()
+
+  await ui.press({ key: 'proj-ws-bbb' }) // switch to clean-project -> back to Tasks
+  expect(await ui.find({ type: 'Text', text: /clean-project/ })).toBeDefined() // now in the header
   await ui.unmount()
 })
 

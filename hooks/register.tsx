@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Feedback, Meta, Notice, Shadow, TaskRow, TraceRow, View } from '../types'
+import type { Feedback, Meta, Notice, ProjectRow, Shadow, Summary, TaskRow, TraceRow, View } from '../types'
 
 const PANE = 'mubit'
 
@@ -27,6 +27,10 @@ const meta = atom(
 const openTrace = atom({ plugin: 'mubit', key: 'openTrace' } as const, null as string | null, { shape: 'open-1' })
 const draft = atom({ plugin: 'mubit', key: 'draft' } as const, '', { shape: 'draft-1' })
 const notice = atom({ plugin: 'mubit', key: 'notice' } as const, null as Notice, { shape: 'notice-1' })
+const activeProject = atom({ plugin: 'mubit', key: 'activeProject' } as const, null as string | null, { shape: 'proj-1' })
+const projects = atom({ plugin: 'mubit', key: 'projects' } as const, [] as ProjectRow[], { shape: 'projects-1' })
+const summary = atom({ plugin: 'mubit', key: 'summary' } as const, null as Summary, { shape: 'summary-1' })
+const newProject = atom({ plugin: 'mubit', key: 'newProject' } as const, '', { shape: 'newproj-1' })
 
 type Config = { command: string; project: string; refreshSeconds: number; requestLimit: number }
 
@@ -114,9 +118,9 @@ function toTraceRow(t: Record<string, unknown>): TraceRow {
 
 type RunResult = { exitCode: number; stdout: string; stderr: string }
 
-// One CLI call, retried once when the engine answers a transient 5xx/unreachable.
-async function runCli($: EngineInterface, cfg: Config, args: string[]): Promise<RunResult> {
-  const argv = [cfg.command, ...args, ...(cfg.project ? ['--project', cfg.project] : [])]
+// One CLI call for the chosen project, retried once on a transient 5xx/unreachable.
+async function runCli($: EngineInterface, cfg: Config, project: string, args: string[]): Promise<RunResult> {
+  const argv = [cfg.command, ...args, ...(project ? ['--project', project] : [])]
   let res = (await $.process.run(argv, { timeoutMs: 25_000 })) as RunResult
   if (res.exitCode !== 0 && transientRe.test(`${res.stderr}${res.stdout}`)) {
     await $.clock.sleep(1500)
@@ -125,10 +129,19 @@ async function runCli($: EngineInterface, cfg: Config, args: string[]): Promise<
   return res
 }
 
-// Load tasks always, traces only in that view. Keeps the last good data on a blip.
+const parse = (res: RunResult): any => {
+  try {
+    return JSON.parse(res.stdout || 'null')
+  } catch {
+    return null
+  }
+}
+
+// Load what the current view needs. Keeps the last good data on a blip.
 // Top-level so the module validator sees $ handed to a declared function.
 async function load($: EngineInterface, cfg: Config): Promise<void> {
   const want = await read($, view)
+  const project = (await read($, activeProject)) || cfg.project
   await update($, meta, m => ({ ...m, loading: true }))
 
   const fail = async (res: RunResult) => {
@@ -138,15 +151,47 @@ async function load($: EngineInterface, cfg: Config): Promise<void> {
   }
 
   try {
-    const tasksRes = await runCli($, cfg, ['tasks', '--json'])
+    if (want === 'projects') {
+      const pr = await runCli($, cfg, '', ['projects', '--json'])
+      if (pr.exitCode !== 0) return await fail(pr)
+      const list = (parse(pr) ?? {}).projects ?? parse(pr) ?? []
+      await update($, projects, () =>
+        (Array.isArray(list) ? list : []).map((p: Record<string, unknown>) => ({
+          slug: str(p.slug),
+          name: str(p.name),
+          status: str(p.status),
+        })),
+      )
+      await update($, meta, () => ({ loadedAt: Date.now(), loading: false, error: null, signedOut: false, transient: false }))
+      return
+    }
+
+    const tasksRes = await runCli($, cfg, project, ['tasks', '--json'])
     if (tasksRes.exitCode !== 0) return await fail(tasksRes)
-    const lanes = JSON.parse(tasksRes.stdout || '[]') as Record<string, unknown>[]
+    const lanes = parse(tasksRes)
     await update($, tasks, () => (Array.isArray(lanes) ? lanes.map(toTaskRow) : []))
 
+    if (want === 'tasks') {
+      // Best-effort extras for the summary: 24h traffic and the gate thresholds.
+      const [mx, pol] = await Promise.all([
+        runCli($, cfg, project, ['metrics', '--json']),
+        runCli($, cfg, project, ['policy', '--json']),
+      ])
+      const t = (parse(mx) ?? {}).totals ?? {}
+      const promo = ((parse(pol) ?? {}).effective ?? {}).promotion ?? {}
+      await update($, summary, () => ({
+        calls: num(t.calls),
+        errors: num(t.errors),
+        p50: Math.round(num(t.p50_ms)),
+        minPairs: num(promo.min_pairs) || 50,
+        bar: typeof promo.bar === 'number' ? promo.bar : 0.9,
+      }))
+    }
+
     if (want === 'requests') {
-      const tr = await runCli($, cfg, ['traces', '--limit', String(cfg.requestLimit), '--json'])
+      const tr = await runCli($, cfg, project, ['traces', '--limit', String(cfg.requestLimit), '--json'])
       if (tr.exitCode !== 0) return await fail(tr)
-      const rows = JSON.parse(tr.stdout || '[]') as Record<string, unknown>[]
+      const rows = parse(tr)
       await update($, traces, () => (Array.isArray(rows) ? rows.map(toTraceRow) : []))
     }
     await update($, meta, () => ({ loadedAt: Date.now(), loading: false, error: null, signedOut: false, transient: false }))
@@ -154,6 +199,29 @@ async function load($: EngineInterface, cfg: Config): Promise<void> {
     const message = firstLine(err instanceof Error ? err.message : String(err))
     await update($, meta, m => ({ ...m, loading: false, error: message, signedOut: signedOutRe.test(message), transient: transientRe.test(message) }))
   }
+}
+
+// Create a project, then refresh the list and switch to it.
+async function createProject($: EngineInterface, cfg: Config, name: string): Promise<void> {
+  if (!name.trim()) return
+  await update($, notice, () => ({ text: 'Creating…', kind: 'ok' }))
+  const res = (await $.process.run([cfg.command, 'project-create', name.trim(), '--json'], { timeoutMs: 25_000 })) as RunResult
+  if (res.exitCode === 0) {
+    const slug = str(((parse(res) ?? {}).project ?? {}).slug)
+    await update($, newProject, () => '')
+    await update($, notice, () => ({ text: `Created ${slug || name}.`, kind: 'ok' }))
+    await load($, cfg)
+  } else {
+    await update($, notice, () => ({ text: firstLine(res.stderr) || `exited ${res.exitCode}`, kind: 'err' }))
+  }
+}
+
+// Switch which project the pane shows, then go back to Tasks and reload.
+async function pickProject($: EngineInterface, cfg: Config, slug: string | null): Promise<void> {
+  await update($, activeProject, () => slug)
+  await update($, view, () => 'tasks')
+  await update($, notice, () => null)
+  await load($, cfg)
 }
 
 // Submit a rating on one call, then refresh so its feedback shows.
@@ -199,7 +267,7 @@ export const register: Register = (on, options) => {
     // Input is on the terminal/desktop tables but not every surface's; take it loosely
     // and guard its use, so the pane still renders where it's absent.
     const Input = (resolved as unknown as { Input?: any }).Input
-    const [current, taskRows, traceRows, m, openId, draftText, note] = await Promise.all([
+    const [current, taskRows, traceRows, m, openId, draftText, note, active, projectRows, sum, newProj] = await Promise.all([
       read($, view),
       read($, tasks),
       read($, traces),
@@ -207,6 +275,10 @@ export const register: Register = (on, options) => {
       read($, openTrace),
       read($, draft),
       read($, notice),
+      read($, activeProject),
+      read($, projects),
+      read($, summary),
+      read($, newProject),
     ])
     const height = Math.max(6, e.props?.scroll?.bodyRows ?? e.viewport?.rows ?? 20)
     const cols = Math.max(24, e.props?.bodyColumns ?? e.viewport?.columns ?? 80)
@@ -244,15 +316,17 @@ export const register: Register = (on, options) => {
       )
     }
 
+    const minPairs = sum?.minPairs ?? 50
     const shadowBlock = (s: Shadow) => {
       const ok = s.rate >= s.need
       const c = ok ? GREEN : ORANGE
       return (
         <Box gap={1}>
           <Text dimColor>shadow {s.passes}/{s.pairs}</Text>
-          {dottedBar(s.rate, Math.min(18, Math.max(8, cols - 34)), c)}
+          {dottedBar(s.rate, Math.min(16, Math.max(8, cols - 44)), c)}
           <Text color={c} bold>{s.rate}%</Text>
           <Text dimColor>→ {s.need}%</Text>
+          <Text dimColor>· {s.pairs}/{minPairs} pairs</Text>
         </Box>
       )
     }
@@ -271,10 +345,17 @@ export const register: Register = (on, options) => {
       const totalCalls = taskRows.reduce((a, t) => a + t.calls, 0)
       return (
         <Box flexDirection="column" gap={1}>
-          <Text dimColor>
-            {taskRows.length} tasks · {totalCalls} calls{shadowCount ? ` · ` : ''}
-            {shadowCount > 0 && <Text color={ORANGE}>◆ {shadowCount} shadow</Text>}
-          </Text>
+          <Box flexDirection="column">
+            <Text dimColor>
+              {taskRows.length} tasks · {totalCalls} calls{shadowCount ? ` · ` : ''}
+              {shadowCount > 0 && <Text color={ORANGE}>◆ {shadowCount} shadow</Text>}
+            </Text>
+            {sum && (
+              <Text dimColor>
+                24h: {sum.calls} calls · {sum.errors > 0 ? <Text color={RED}>{sum.errors} errors</Text> : '0 errors'} · p50 {sum.p50}ms
+              </Text>
+            )}
+          </Box>
           {taskRows.slice(0, Math.max(1, Math.floor((bodyRows - 1) / 4))).map(t => {
             const { g, c } = stageStyle(t.stage)
             return (
@@ -389,6 +470,46 @@ export const register: Register = (on, options) => {
       )
     }
 
+    const projectsView = () => (
+      <Box flexDirection="column" gap={1}>
+        <Text dimColor>Pick the project the pane shows:</Text>
+        <Box flexDirection="column">
+          <Button key="proj-default" plain onPress={() => void pickProject($, cfg, null)}>
+            <Text color={active === null ? ORANGE : undefined} bold={active === null}>
+              {active === null ? '● ' : '  '}console default
+            </Text>
+          </Button>
+          {projectRows.slice(0, Math.max(1, bodyRows - 5)).map(p => (
+            <Button key={`proj-${p.slug}`} plain onPress={() => void pickProject($, cfg, p.slug)}>
+              <Text color={active === p.slug ? ORANGE : undefined} bold={active === p.slug}>
+                {active === p.slug ? '● ' : '  '}
+                {padR(p.name, Math.min(26, cols - 26))}
+              </Text>
+              <Text dimColor> {p.slug} {p.status}</Text>
+            </Button>
+          ))}
+        </Box>
+        {note && <Text color={note.kind === 'ok' ? GREEN : RED}>{note.text}</Text>}
+        {Input && (
+          <Box gap={1}>
+            <Text dimColor>+ new</Text>
+            <Box width={Math.min(34, cols - 14)}>
+              <Input
+                key="newproj"
+                placeholder="project name"
+                value={newProj}
+                onInput={(v: string) => void update($, newProject, () => v)}
+                onSubmit={(v: string) => void createProject($, cfg, v)}
+              />
+            </Box>
+            <Button key="create" plain onPress={() => void createProject($, cfg, newProj)}>
+              <Text color={GREEN}>Create</Text>
+            </Button>
+          </Box>
+        )}
+      </Box>
+    )
+
     const body = () => {
       if (m.signedOut) {
         return (
@@ -408,6 +529,7 @@ export const register: Register = (on, options) => {
           </Box>
         )
       }
+      if (current === 'projects') return projectsView()
       if (current === 'tasks') return tasksView()
       if (openId) {
         const row = traceRows.find(r => r.id === openId)
@@ -431,9 +553,12 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column" height={height}>
-        <Box>
-          <Text bold color={ORANGE}>◈ MUBIT</Text>
-          <Text dimColor> · {current === 'tasks' ? 'Tasks' : openId ? 'Call' : 'Requests'}</Text>
+        <Box justifyContent="space-between">
+          <Text>
+            <Text bold color={ORANGE}>◈ MUBIT</Text>
+            <Text dimColor> · {current === 'projects' ? 'Projects' : current === 'tasks' ? 'Tasks' : openId ? 'Call' : 'Requests'}</Text>
+          </Text>
+          <Text dimColor>{active ? (projectRows.find(p => p.slug === active)?.name ?? active) : 'default project'}</Text>
         </Box>
         <Text dimColor>{'─'.repeat(cols)}</Text>
 
@@ -447,6 +572,7 @@ export const register: Register = (on, options) => {
           <Box gap={2}>
             {tab('tasks', 'Tasks')}
             {tab('requests', 'Requests')}
+            {tab('projects', 'Projects')}
           </Box>
           <Box gap={1}>
             <Button key="refresh" plain onPress={() => void load($, cfg)}>
