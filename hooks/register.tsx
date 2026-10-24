@@ -1,0 +1,460 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
+
+import type { Feedback, Meta, Notice, Shadow, TaskRow, TraceRow, View } from '../types'
+
+const PANE = 'mubit'
+
+// Palette drawn from the reference: warm coral-orange as the one accent (Mubit's
+// brand), with green/red/amber for pass, fail and attention. Hex reads on both
+// dark and light terminals; dim gray for everything secondary.
+const ORANGE = '#E8835A'
+const GREEN = '#6FBF73'
+const RED = '#E0564C'
+const AMBER = '#D9A441'
+const INK = '#14110f' // text that sits on an orange fill
+
+// Change a tag when the stored shape changes; it discards what an older version wrote.
+const view = atom({ plugin: 'mubit', key: 'view' } as const, 'tasks' as View, { shape: 'view-1' })
+const tasks = atom({ plugin: 'mubit', key: 'tasks' } as const, [] as TaskRow[], { shape: 'tasks-2' })
+const traces = atom({ plugin: 'mubit', key: 'traces' } as const, [] as TraceRow[], { shape: 'traces-2' })
+const meta = atom(
+  { plugin: 'mubit', key: 'meta' } as const,
+  { loadedAt: null, loading: false, error: null, signedOut: false, transient: false } as Meta,
+  { shape: 'meta-2' },
+)
+const openTrace = atom({ plugin: 'mubit', key: 'openTrace' } as const, null as string | null, { shape: 'open-1' })
+const draft = atom({ plugin: 'mubit', key: 'draft' } as const, '', { shape: 'draft-1' })
+const notice = atom({ plugin: 'mubit', key: 'notice' } as const, null as Notice, { shape: 'notice-1' })
+
+type Config = { command: string; project: string; refreshSeconds: number; requestLimit: number }
+
+function readConfig(options: unknown): Config {
+  const o = (options ?? {}) as Partial<Config>
+  return {
+    command: o.command?.trim() || 'mubit',
+    project: o.project?.trim() || '',
+    refreshSeconds: Math.max(10, Number(o.refreshSeconds) || 60),
+    requestLimit: Math.max(1, Math.min(100, Number(o.requestLimit) || 15)),
+  }
+}
+
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+
+// The CLI prints these when the saved sign-in has lapsed, or when the engine is briefly down.
+const signedOutRe = /sign ?in|clerk|session_(required|expired)|not signed in/i
+const transientRe = /\b5\d\d\b|engine_unreachable|unreachable|upstream_(failed|timeout|unreachable)|timed out|timeout/i
+
+function firstLine(text: string): string {
+  return (text.split('\n').find(l => l.trim()) ?? '').trim().slice(0, 240)
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) return content.map(p => str((p as Record<string, unknown>)?.text)).join(' ').trim()
+  return ''
+}
+
+function toTaskRow(l: Record<string, unknown>): TaskRow {
+  const counts = (l.counts ?? {}) as Record<string, unknown>
+  const live = l.live as Record<string, unknown> | null | undefined
+  const shadow: Shadow | null = live
+    ? {
+        passes: num(live.passes),
+        pairs: num(live.pairs),
+        rate: Math.round(num(live.rate) * 100),
+        need: Math.round(num(live.bar) * 100),
+      }
+    : null
+  return {
+    id: str(l.id),
+    name: str(l.name) || str(l.label) || str(l.id),
+    stage: str(l.stage),
+    calls: num(counts.traces),
+    up: num(counts.rated_up),
+    down: num(counts.rated_down),
+    unrated: num(counts.unrated),
+    adapter: str(l.adapter_id),
+    shadow,
+  }
+}
+
+function toTraceRow(t: Record<string, unknown>): TraceRow {
+  const up = (t.upstream ?? {}) as Record<string, unknown>
+  const routing = (t.routing ?? {}) as Record<string, unknown>
+  const resp = (t.response ?? {}) as Record<string, unknown>
+  const req = (t.request ?? {}) as Record<string, unknown>
+  const choices = Array.isArray(resp.choices) ? (resp.choices as Record<string, unknown>[]) : []
+  const reply = messageText((choices[0]?.message as Record<string, unknown>)?.content)
+  const msgs = Array.isArray(req.messages) ? (req.messages as Record<string, unknown>[]) : []
+  const lastUser = [...msgs].reverse().find(mm => str(mm.role) === 'user')
+  const feedback = Array.isArray(t.feedback) ? (t.feedback as Record<string, unknown>[]) : []
+  const fb: Feedback[] = feedback.map(f => ({
+    rating: str(f.rating),
+    comment: str(f.comment),
+    source: str(f.source),
+    at: str(f.at),
+  }))
+  return {
+    id: str(t.trace_id),
+    time: str(t.created_at).slice(11, 19),
+    purpose: str(t.purpose) || str(routing.decision),
+    answeredBy: [str(up.vendor), str(up.model)].filter(Boolean).join(' '),
+    model: str(resp.model) || str(up.model),
+    ms: typeof up.latency_ms === 'number' ? Math.round(up.latency_ms as number) : null,
+    status: typeof t.http_status === 'number' ? (t.http_status as number) : null,
+    rating: str(fb.at(-1)?.rating),
+    req: messageText(lastUser?.content),
+    reply,
+    fb,
+  }
+}
+
+type RunResult = { exitCode: number; stdout: string; stderr: string }
+
+// One CLI call, retried once when the engine answers a transient 5xx/unreachable.
+async function runCli($: EngineInterface, cfg: Config, args: string[]): Promise<RunResult> {
+  const argv = [cfg.command, ...args, ...(cfg.project ? ['--project', cfg.project] : [])]
+  let res = (await $.process.run(argv, { timeoutMs: 25_000 })) as RunResult
+  if (res.exitCode !== 0 && transientRe.test(`${res.stderr}${res.stdout}`)) {
+    await $.clock.sleep(1500)
+    res = (await $.process.run(argv, { timeoutMs: 25_000 })) as RunResult
+  }
+  return res
+}
+
+// Load tasks always, traces only in that view. Keeps the last good data on a blip.
+// Top-level so the module validator sees $ handed to a declared function.
+async function load($: EngineInterface, cfg: Config): Promise<void> {
+  const want = await read($, view)
+  await update($, meta, m => ({ ...m, loading: true }))
+
+  const fail = async (res: RunResult) => {
+    const message = firstLine(res.stderr) || firstLine(res.stdout) || `mubit exited ${res.exitCode}`
+    const transient = transientRe.test(message)
+    await update($, meta, m => ({ ...m, loading: false, error: message, signedOut: signedOutRe.test(message), transient }))
+  }
+
+  try {
+    const tasksRes = await runCli($, cfg, ['tasks', '--json'])
+    if (tasksRes.exitCode !== 0) return await fail(tasksRes)
+    const lanes = JSON.parse(tasksRes.stdout || '[]') as Record<string, unknown>[]
+    await update($, tasks, () => (Array.isArray(lanes) ? lanes.map(toTaskRow) : []))
+
+    if (want === 'requests') {
+      const tr = await runCli($, cfg, ['traces', '--limit', String(cfg.requestLimit), '--json'])
+      if (tr.exitCode !== 0) return await fail(tr)
+      const rows = JSON.parse(tr.stdout || '[]') as Record<string, unknown>[]
+      await update($, traces, () => (Array.isArray(rows) ? rows.map(toTraceRow) : []))
+    }
+    await update($, meta, () => ({ loadedAt: Date.now(), loading: false, error: null, signedOut: false, transient: false }))
+  } catch (err) {
+    const message = firstLine(err instanceof Error ? err.message : String(err))
+    await update($, meta, m => ({ ...m, loading: false, error: message, signedOut: signedOutRe.test(message), transient: transientRe.test(message) }))
+  }
+}
+
+// Submit a rating on one call, then refresh so its feedback shows.
+async function rate($: EngineInterface, cfg: Config, id: string, rating: 'up' | 'down', comment: string): Promise<void> {
+  await update($, notice, () => ({ text: 'Saving…', kind: 'ok' }))
+  const args = ['rate', id, rating, ...(comment.trim() ? ['--comment', comment.trim()] : []), '--json']
+  const res = (await $.process.run([cfg.command, ...args], { timeoutMs: 25_000 })) as RunResult
+  if (res.exitCode === 0) {
+    await update($, draft, () => '')
+    await update($, notice, () => ({ text: `Saved 👍/👎 ${rating}.`, kind: 'ok' }))
+    await load($, cfg)
+  } else {
+    const message = firstLine(res.stderr) || firstLine(res.stdout) || `rate exited ${res.exitCode}`
+    await update($, notice, () => ({ text: message, kind: 'err' }))
+  }
+}
+
+export const register: Register = (on, options) => {
+  const cfg = readConfig(options)
+
+  on('session.start', async ($, e, next) => {
+    // `/mubit` belongs to the Mubit skill, so the pane's command is `/mubit-ui`.
+    try {
+      await $.command.register({ name: 'mubit-ui', description: 'Open the Mubit task-stats pane' })
+    } catch (err) {
+      $.ui.log(`mubit: command.register skipped: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+    }
+    void $.ui.open({ id: PANE, title: 'Mubit' })
+    void load($, cfg)
+    $.clock.every(cfg.refreshSeconds * 1000, () => void load($, cfg))
+    return next(e)
+  })
+
+  on('command.run', { command: 'mubit-ui' }, async $ => {
+    await $.ui.open({ id: PANE, title: 'Mubit' })
+    void load($, cfg)
+    return { text: 'Mubit pane opened.' }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const resolved = $.ui.resolve(e)
+    const { Box, Text, Button } = resolved
+    // Input is on the terminal/desktop tables but not every surface's; take it loosely
+    // and guard its use, so the pane still renders where it's absent.
+    const Input = (resolved as unknown as { Input?: any }).Input
+    const [current, taskRows, traceRows, m, openId, draftText, note] = await Promise.all([
+      read($, view),
+      read($, tasks),
+      read($, traces),
+      read($, meta),
+      read($, openTrace),
+      read($, draft),
+      read($, notice),
+    ])
+    const height = Math.max(6, e.props?.scroll?.bodyRows ?? e.viewport?.rows ?? 20)
+    const cols = Math.max(24, e.props?.bodyColumns ?? e.viewport?.columns ?? 80)
+    const bodyRows = Math.max(1, height - 4) // title, rule, content, rule, footer => 4 chrome rows
+
+    const clip = (s: string, n: number) => (n <= 1 ? '' : s.length > n ? `${s.slice(0, n - 1)}…` : s)
+    const padR = (s: string, n: number) => clip(s, n).padEnd(n)
+    const padL = (s: string, n: number) => clip(s, n).padStart(n)
+
+    const switchTo = (v: View) => async () => {
+      await update($, openTrace, () => null)
+      await update($, notice, () => null)
+      await update($, view, () => v)
+      void load($, cfg)
+    }
+
+    const freshness = (): string => {
+      const blip = m.transient ? ' · retrying' : ''
+      if (m.loadedAt === null) return m.loading ? 'loading…' : ''
+      const ago = Math.round((Date.now() - m.loadedAt) / 1000)
+      return `${ago < 1 ? 'just now' : `${ago}s ago`}${m.loading ? ' · refreshing' : blip}`
+    }
+
+    // A dotted meter in the reference's style: a sparse `·` track with a textured
+    // `▒…█` fill on top, the head brighter. Two spans so the fill alone is coloured.
+    const dottedBar = (pct: number, w: number, color: string) => {
+      const filled = Math.max(0, Math.min(w, Math.round((pct / 100) * w)))
+      const fill = filled > 0 ? `${'▒'.repeat(Math.max(0, filled - 1))}█` : ''
+      const track = '·'.repeat(w - filled)
+      return (
+        <Text>
+          <Text color={color}>{fill}</Text>
+          <Text dimColor>{track}</Text>
+        </Text>
+      )
+    }
+
+    const shadowBlock = (s: Shadow) => {
+      const ok = s.rate >= s.need
+      const c = ok ? GREEN : ORANGE
+      return (
+        <Box gap={1}>
+          <Text dimColor>shadow {s.passes}/{s.pairs}</Text>
+          {dottedBar(s.rate, Math.min(18, Math.max(8, cols - 34)), c)}
+          <Text color={c} bold>{s.rate}%</Text>
+          <Text dimColor>→ {s.need}%</Text>
+        </Box>
+      )
+    }
+
+    // A status glyph + colour per stage, echoing the reference's "+ running / ✓ done".
+    const stageStyle = (stage: string): { g: string; c?: string } =>
+      stage === 'serving' || stage === 'canary'
+        ? { g: '●', c: GREEN }
+        : stage === 'shadow'
+          ? { g: '◆', c: ORANGE }
+          : { g: '·', c: undefined }
+
+    const tasksView = () => {
+      if (taskRows.length === 0) return <Text dimColor>{m.loading ? 'Loading…' : 'No tasks yet.'}</Text>
+      const shadowCount = taskRows.filter(t => t.shadow).length
+      const totalCalls = taskRows.reduce((a, t) => a + t.calls, 0)
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text dimColor>
+            {taskRows.length} tasks · {totalCalls} calls{shadowCount ? ` · ` : ''}
+            {shadowCount > 0 && <Text color={ORANGE}>◆ {shadowCount} shadow</Text>}
+          </Text>
+          {taskRows.slice(0, Math.max(1, Math.floor((bodyRows - 1) / 4))).map(t => {
+            const { g, c } = stageStyle(t.stage)
+            return (
+              <Box key={t.id} flexDirection="column">
+                <Box justifyContent="space-between">
+                  <Text bold>{clip(t.name, cols - 14)}</Text>
+                  <Text color={c}>{g} {t.stage}</Text>
+                </Box>
+                <Box gap={2}>
+                  <Text dimColor>{t.calls} calls</Text>
+                  <Text>
+                    <Text color={GREEN}>+{t.up}</Text>
+                    <Text dimColor> / </Text>
+                    <Text color={RED}>−{t.down}</Text>
+                  </Text>
+                  {t.unrated > 0 && <Text dimColor>{t.unrated} unrated</Text>}
+                </Box>
+                {t.shadow && shadowBlock(t.shadow)}
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
+
+    const requestsList = () => {
+      if (traceRows.length === 0) return <Text dimColor>{m.loading ? 'Loading…' : 'No recent calls.'}</Text>
+      const barW = 7
+      const nameW = Math.max(12, cols - 9 - barW - 1 - 7 - 4 - 3)
+      const maxMs = Math.max(1, ...traceRows.map(r => r.ms ?? 0))
+      const head = `${padR('TIME', 9)}${padR('ANSWERED BY', nameW)}${padR('LATENCY', barW + 1 + 7)}${padL('ST', 4)}`
+      return (
+        <Box flexDirection="column">
+          <Text dimColor bold>
+            {head}
+          </Text>
+          {traceRows.slice(0, bodyRows - 2).map((r, i) => {
+            const adapter = /vllm|qwen|adapter/i.test(r.answeredBy)
+            const emoji = r.rating === 'up' ? '👍' : r.rating === 'down' ? '👎' : '  '
+            return (
+              <Button key={`row-${r.id || i}`} plain onPress={() => void update($, openTrace, () => r.id)}>
+                <Text dimColor>{padR(r.time, 9)}</Text>
+                <Text color={adapter ? ORANGE : undefined}>{padR(r.answeredBy || r.purpose, nameW)}</Text>
+                {dottedBar(((r.ms ?? 0) / maxMs) * 100, barW, adapter ? ORANGE : AMBER)}
+                <Text dimColor> {padL(r.ms === null ? '' : `${r.ms}ms`, 7)}</Text>
+                <Text color={r.status === 200 ? GREEN : r.status ? RED : undefined}> {padL(String(r.status ?? ''), 3)}</Text>
+                <Text> {emoji}</Text>
+              </Button>
+            )
+          })}
+          {traceRows.length > bodyRows - 2 && <Text dimColor>  +{traceRows.length - (bodyRows - 2)} more</Text>}
+        </Box>
+      )
+    }
+
+    const requestDetail = (r: TraceRow) => {
+      const w = cols - 2
+      return (
+        <Box flexDirection="column">
+          <Button key="back" plain onPress={() => void update($, openTrace, () => null)}>
+            <Text color={ORANGE}>← Back</Text>
+          </Button>
+          <Box gap={2}>
+            <Text dimColor>{r.time}</Text>
+            <Text color={/vllm|qwen|adapter/i.test(r.answeredBy) ? ORANGE : undefined}>{r.model || r.answeredBy}</Text>
+            <Text color={r.status === 200 ? GREEN : RED}>{r.status ?? ''}</Text>
+            {r.ms !== null && <Text dimColor>{r.ms}ms</Text>}
+          </Box>
+          <Text> </Text>
+          <Text dimColor bold>REQUEST</Text>
+          <Text wrap="truncate-end">{clip(r.req || '(none)', w * 2)}</Text>
+          <Text dimColor bold>REPLY</Text>
+          <Text wrap="truncate-end">{clip(r.reply || '(none)', w * 2)}</Text>
+          <Text> </Text>
+          {r.fb.length > 0 ? (
+            <Box flexDirection="column">
+              <Text dimColor bold>FEEDBACK</Text>
+              {r.fb.slice(-3).map((f, i) => (
+                <Text key={String(i)}>
+                  {f.rating === 'up' ? '👍' : '👎'} <Text dimColor>{clip(f.comment || '(no note)', w - 12)} · {f.source}</Text>
+                </Text>
+              ))}
+            </Box>
+          ) : (
+            <Text dimColor>No feedback yet — add one below.</Text>
+          )}
+          {note && (
+            <Text color={note.kind === "ok" ? GREEN : RED}>{note.text}</Text>
+          )}
+          <Text> </Text>
+          {Input && (
+            <Box width={Math.min(60, w)}>
+              <Input
+                key="comment"
+                label="Note "
+                placeholder="why (optional)"
+                value={draftText}
+                onInput={(v: string) => void update($, draft, () => v)}
+                onSubmit={() => void rate($, cfg, r.id, 'up', draftText)}
+              />
+            </Box>
+          )}
+          <Box gap={2}>
+            <Button key="up" plain onPress={() => void rate($, cfg, r.id, 'up', draftText)}>
+              <Text color={GREEN}>👍 Rate up</Text>
+            </Button>
+            <Button key="down" plain onPress={() => void rate($, cfg, r.id, 'down', draftText)}>
+              <Text color={RED}>👎 Rate down</Text>
+            </Button>
+          </Box>
+        </Box>
+      )
+    }
+
+    const body = () => {
+      if (m.signedOut) {
+        return (
+          <Box flexDirection="column" gap={1}>
+            <Text color={AMBER}>Signed out.</Text>
+            <Text dimColor>Run `mubit login` in a terminal, then Refresh.</Text>
+          </Box>
+        )
+      }
+      if (m.error && m.loadedAt === null) {
+        return (
+          <Box flexDirection="column" gap={1}>
+            <Text color={m.transient ? AMBER : RED}>
+              {m.transient ? 'Mubit is briefly unreachable — retrying.' : "Couldn't reach Mubit."}
+            </Text>
+            <Text dimColor wrap="wrap">{m.error}</Text>
+          </Box>
+        )
+      }
+      if (current === 'tasks') return tasksView()
+      if (openId) {
+        const row = traceRows.find(r => r.id === openId)
+        return row ? requestDetail(row) : <Text dimColor>That call is no longer in the list. ← Back with Refresh.</Text>
+      }
+      return requestsList()
+    }
+
+    // Tabs as `[ label ]`: the active one a solid orange chip with ink text,
+    // the rest dim — straight from the reference's nav.
+    const tab = (v: View, label: string) =>
+      current === v ? (
+        <Button key={v} plain onPress={switchTo(v)}>
+          <Text bold backgroundColor={ORANGE} color={INK}>{` ${label} `}</Text>
+        </Button>
+      ) : (
+        <Button key={v} plain onPress={switchTo(v)}>
+          <Text dimColor>[ {label} ]</Text>
+        </Button>
+      )
+
+    return (
+      <Box flexDirection="column" height={height}>
+        <Box>
+          <Text bold color={ORANGE}>◈ MUBIT</Text>
+          <Text dimColor> · {current === 'tasks' ? 'Tasks' : openId ? 'Call' : 'Requests'}</Text>
+        </Box>
+        <Text dimColor>{'─'.repeat(cols)}</Text>
+
+        <Box flexDirection="column" flexGrow={1}>
+          {body()}
+        </Box>
+
+        {/* Controls: tab selection on the left; Refresh and when it last ran on the right. */}
+        <Text dimColor>{'─'.repeat(cols)}</Text>
+        <Box justifyContent="space-between">
+          <Box gap={2}>
+            {tab('tasks', 'Tasks')}
+            {tab('requests', 'Requests')}
+          </Box>
+          <Box gap={1}>
+            <Button key="refresh" plain onPress={() => void load($, cfg)}>
+              <Text dimColor>↻ Refresh</Text>
+            </Button>
+            {freshness() && <Text dimColor>· {freshness()}</Text>}
+          </Box>
+        </Box>
+      </Box>
+    )
+  })
+}

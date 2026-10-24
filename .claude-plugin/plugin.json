@@ -1,0 +1,33 @@
+{
+  "name": "mubit",
+  "version": "0.1.0",
+  "description": "A pane of Mubit task stats, with an optional Requests view, from the mubit CLI",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "command": {
+      "type": "string",
+      "default": "mubit",
+      "description": "The mubit CLI command (name on PATH, or an absolute path)",
+      "title": "CLI command"
+    },
+    "project": {
+      "type": "string",
+      "default": "",
+      "description": "Project slug to show (empty: the console's current project)",
+      "title": "Project slug"
+    },
+    "refreshSeconds": {
+      "type": "number",
+      "default": 60,
+      "description": "How often to refresh, in seconds",
+      "title": "Refresh (seconds)"
+    },
+    "requestLimit": {
+      "type": "number",
+      "default": 15,
+      "description": "How many recent calls the Requests view loads",
+      "title": "Requests to load"
+    }
+  },
+  "license": "MIT"
+}

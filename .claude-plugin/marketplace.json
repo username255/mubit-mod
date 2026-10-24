@@ -1,0 +1,14 @@
+{
+  "name": "mubit-mod",
+  "owner": {
+    "name": "username255"
+  },
+  "plugins": [
+    {
+      "name": "mubit",
+      "source": "./",
+      "description": "A pane of Mubit task stats, with a drill-in Requests view and feedback, from the mubit CLI"
+    }
+  ],
+  "description": "Mubit mods for Claude Code"
+}
