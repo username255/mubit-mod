@@ -12,6 +12,7 @@ const ORANGE = '#E8835A'
 const GREEN = '#6FBF73'
 const RED = '#E0564C'
 const AMBER = '#D9A441'
+const MUTED = '#7d7d7d' // a neutral fill for bars that aren't the accent
 const INK = '#14110f' // text that sits on an orange fill
 
 // Change a tag when the stored shape changes; it discards what an older version wrote.
@@ -317,7 +318,7 @@ export const register: Register = (on, options) => {
               <Button key={`row-${r.id || i}`} plain onPress={() => void update($, openTrace, () => r.id)}>
                 <Text dimColor>{padR(r.time, 9)}</Text>
                 <Text color={adapter ? ORANGE : undefined}>{padR(r.answeredBy || r.purpose, nameW)}</Text>
-                {dottedBar(((r.ms ?? 0) / maxMs) * 100, barW, adapter ? ORANGE : AMBER)}
+                {dottedBar(((r.ms ?? 0) / maxMs) * 100, barW, adapter ? ORANGE : MUTED)}
                 <Text dimColor> {padL(r.ms === null ? '' : `${r.ms}ms`, 7)}</Text>
                 <Text color={r.status === 200 ? GREEN : r.status ? RED : undefined}> {padL(String(r.status ?? ''), 3)}</Text>
                 <Text> {emoji}</Text>
@@ -344,9 +345,9 @@ export const register: Register = (on, options) => {
           </Box>
           <Text> </Text>
           <Text dimColor bold>REQUEST</Text>
-          <Text wrap="truncate-end">{clip(r.req || '(none)', w * 2)}</Text>
+          <Text wrap="wrap">{clip(r.req || '(none)', w * 2)}</Text>
           <Text dimColor bold>REPLY</Text>
-          <Text wrap="truncate-end">{clip(r.reply || '(none)', w * 2)}</Text>
+          <Text wrap="wrap">{clip(r.reply || '(none)', w * 2)}</Text>
           <Text> </Text>
           {r.fb.length > 0 ? (
             <Box flexDirection="column">
