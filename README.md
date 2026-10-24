@@ -5,8 +5,6 @@ tasks with their stage, call counts and a dotted shadow-promotion meter, and a
 Requests view you can drill into to read a call and leave 👍/👎 feedback. It reads
 live data through the `mubit` CLI and refreshes on a timer.
 
-![pane](docs/pane.png)
-
 ## Requires
 
 The [`mubit` CLI](https://github.com/username255/mubit-cli) on your PATH, signed in
