@@ -27,10 +27,13 @@ Then open the pane with `/mubit-ui` (it also opens on its own on a wide terminal
   per task: name, stage (`◆ shadow`, `● serving`, `· collecting`), calls, `+up / −down`
   ratings, and a dotted meter of the shadow pass rate against the bar it must clear
   (orange below, green once it clears), with pairs-to-go (`13/50 pairs`).
-- **Requests** — recent calls with who answered each (the adapter in orange, the
-  provider dim), a dotted latency bar, status and rating. Click a row to open the
-  call: its request and reply, any existing feedback, and 👍/👎 buttons with a note
-  field to add your own.
+- **Requests** — calls, newest first, with who answered each (the adapter in orange, the
+  provider dim; `◆` marks a silent-test reply), a dotted latency bar, status and rating.
+  **Show all / traffic / shadow** picks which calls to list. **Older ›** and **‹ Newer**
+  page through them; Older fetches the next page from Mubit when it runs out (needs a
+  `mubit` CLI with `traces --with-cursor`; an older CLI shows one page). Click a row to
+  open the call: its request and reply, any existing feedback, and 👍/👎 buttons with a
+  note field to add your own.
 - **Projects** — every project, the active one marked; click to switch which project the
   pane shows, or type a name and **Create** a new one. The active project appears in the
   header and scopes every view.

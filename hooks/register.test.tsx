@@ -128,6 +128,65 @@ test('a request with no feedback can be rated', async ($, on) => {
   await ui.unmount()
 })
 
+// The paging CLI's `traces --with-cursor` shape: a first page with a cursor, then the last page.
+const call = (id: string, text: string, purpose = 'traffic') => ({
+  trace_id: id,
+  created_at: '2026-10-23T21:23:00.000Z',
+  purpose,
+  routing: { decision: purpose === 'shadow' ? 'adapter' : 'direct' },
+  upstream: purpose === 'shadow' ? { vendor: 'vllm', model: 'Qwen/Qwen3-4B', latency_ms: 51 } : { vendor: 'openai', model: 'gpt-6-luna', latency_ms: 1200 },
+  response: { choices: [{ message: { content: 'even' } }] },
+  request: { messages: [{ role: 'user', content: text }] },
+  http_status: 200,
+  feedback: [],
+})
+const PAGE_1 = JSON.stringify({ traces: [call('trc_p1', 'Is 190 odd or even?')], next_cursor: 't1~200~1~abc', pages: 3 })
+const PAGE_2 = JSON.stringify({ traces: [call('trc_p2', '-2518 Wrong answers only')], next_cursor: null, pages: 1 })
+const SHADOW = JSON.stringify({ traces: [call('trc_s1', 'MCCXL Wrong answers only', 'shadow')], next_cursor: null, pages: 29 })
+
+const wirePaged = (on: any, seen: string[][]) => {
+  on('command.register', () => ({ value: { command: 'mubit' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('process.run', (_: unknown, e: { argv: readonly string[] }) => {
+    seen.push([...e.argv])
+    const stdout = !e.argv.includes('traces') ? stdoutFor(e.argv)
+      : e.argv.includes('shadow') ? SHADOW
+      : e.argv.includes('--cursor') ? PAGE_2
+      : PAGE_1
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+}
+
+test('Older fetches the next page with the CLI cursor', async ($, on) => {
+  const seen: string[][] = []
+  wirePaged(on, seen)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'requests' })
+  expect(await ui.find({ type: 'Text', text: /1–1 of 1\+/ })).toBeDefined()
+
+  await ui.press({ key: 'older' })
+  expect(seen.some(a => a.includes('--cursor') && a.includes('t1~200~1~abc'))).toBe(true)
+  await ui.press({ key: 'row-trc_p2' })
+  expect(await ui.find({ type: 'Text', text: /-2518 Wrong answers only/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the shadow filter lists silent-test calls only', async ($, on) => {
+  const seen: string[][] = []
+  wirePaged(on, seen)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'requests' })
+  await ui.press({ key: 'filter-shadow' })
+
+  const traces = seen.filter(a => a.includes('traces')).at(-1) ?? []
+  expect(traces.join(' ')).toBe('mubit traces --limit 15 --json --with-cursor --purpose shadow')
+  expect(await ui.find({ type: 'Text', text: /◆ vllm Qwen/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a signed-out CLI shows the login hint', async ($, on) => {
   on('command.register', () => ({ value: { command: 'mubit' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))

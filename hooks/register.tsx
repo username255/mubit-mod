@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Feedback, Meta, Notice, ProjectRow, Shadow, Summary, TaskRow, TraceRow, View } from '../types'
+import type { Feedback, Meta, Notice, ProjectRow, RequestFilter, Shadow, Summary, TaskRow, TraceRow, View } from '../types'
 
 const PANE = 'mubit'
 
@@ -31,6 +31,10 @@ const activeProject = atom({ plugin: 'mubit', key: 'activeProject' } as const, n
 const projects = atom({ plugin: 'mubit', key: 'projects' } as const, [] as ProjectRow[], { shape: 'projects-1' })
 const summary = atom({ plugin: 'mubit', key: 'summary' } as const, null as Summary, { shape: 'summary-1' })
 const newProject = atom({ plugin: 'mubit', key: 'newProject' } as const, '', { shape: 'newproj-1' })
+const requestFilter = atom({ plugin: 'mubit', key: 'requestFilter' } as const, 'all' as RequestFilter, { shape: 'filter-1' })
+const traceCursor = atom({ plugin: 'mubit', key: 'traceCursor' } as const, null as string | null, { shape: 'cursor-1' })
+const tracePages = atom({ plugin: 'mubit', key: 'tracePages' } as const, 1, { shape: 'pages-1' })
+const requestStart = atom({ plugin: 'mubit', key: 'requestStart' } as const, 0, { shape: 'start-1' })
 
 type Config = { command: string; project: string; refreshSeconds: number; requestLimit: number }
 
@@ -137,6 +141,59 @@ const parse = (res: RunResult): any => {
   }
 }
 
+type TracePage = { rows: TraceRow[]; next: string | null }
+
+// One page of calls through `traces --with-cursor`, from the start or from a cursor.
+// A CLI from before paging knows neither flag: show its one page and offer no more.
+async function tracePage($: EngineInterface, cfg: Config, project: string, filter: RequestFilter, cursor: string | null): Promise<TracePage | RunResult> {
+  const base = ['traces', '--limit', String(cfg.requestLimit), '--json']
+  let res = await runCli($, cfg, project, [...base, '--with-cursor', ...(filter === 'all' ? [] : ['--purpose', filter]), ...(cursor ? ['--cursor', cursor] : [])])
+  if (res.exitCode !== 0 && /unknown option/i.test(res.stderr)) {
+    if (cursor) return { rows: [], next: null }
+    res = await runCli($, cfg, project, [...base, ...(filter === 'shadow' ? ['--shadow'] : [])])
+  }
+  if (res.exitCode !== 0) return res
+  const out = parse(res)
+  const list = Array.isArray(out) ? out : Array.isArray(out?.traces) ? out.traces : []
+  return { rows: list.map(toTraceRow), next: Array.isArray(out) ? null : str(out?.next_cursor) || null }
+}
+
+// Fetch the page after the last one loaded and append it.
+async function loadMore($: EngineInterface, cfg: Config): Promise<void> {
+  const cursor = await read($, traceCursor)
+  if (!cursor) return
+  const project = (await read($, activeProject)) || cfg.project
+  await update($, meta, m => ({ ...m, loading: true }))
+  const page = await tracePage($, cfg, project, await read($, requestFilter), cursor)
+  if ('exitCode' in page) {
+    const message = firstLine(page.stderr) || firstLine(page.stdout) || `mubit exited ${page.exitCode}`
+    await update($, meta, m => ({ ...m, loading: false, error: message, signedOut: signedOutRe.test(message), transient: transientRe.test(message) }))
+    return
+  }
+  await update($, traces, old => {
+    const ids = new Set(old.map(r => r.id))
+    return [...old, ...page.rows.filter(r => !ids.has(r.id))]
+  })
+  await update($, traceCursor, () => page.next)
+  await update($, tracePages, p => p + 1)
+  await update($, meta, m => ({ ...m, loading: false, error: null }))
+}
+
+// Start the Requests list over: first page, top of the list.
+async function resetRequests($: EngineInterface): Promise<void> {
+  await update($, traces, () => [])
+  await update($, traceCursor, () => null)
+  await update($, tracePages, () => 1)
+  await update($, requestStart, () => 0)
+}
+
+async function setFilter($: EngineInterface, cfg: Config, filter: RequestFilter): Promise<void> {
+  await update($, requestFilter, () => filter)
+  await update($, openTrace, () => null)
+  await resetRequests($)
+  await load($, cfg)
+}
+
 // Load what the current view needs. Keeps the last good data on a blip.
 // Top-level so the module validator sees $ handed to a declared function.
 async function load($: EngineInterface, cfg: Config): Promise<void> {
@@ -189,10 +246,16 @@ async function load($: EngineInterface, cfg: Config): Promise<void> {
     }
 
     if (want === 'requests') {
-      const tr = await runCli($, cfg, project, ['traces', '--limit', String(cfg.requestLimit), '--json'])
-      if (tr.exitCode !== 0) return await fail(tr)
-      const rows = parse(tr)
-      await update($, traces, () => (Array.isArray(rows) ? rows.map(toTraceRow) : []))
+      const page = await tracePage($, cfg, project, await read($, requestFilter), null)
+      if ('exitCode' in page) return await fail(page)
+      if ((await read($, tracePages)) > 1) {
+        // Older pages stay loaded: the newest page goes in front, the rest keep their place.
+        const ids = new Set(page.rows.map(r => r.id))
+        await update($, traces, old => [...page.rows, ...old.filter(r => !ids.has(r.id))])
+      } else {
+        await update($, traces, () => page.rows)
+        await update($, traceCursor, () => page.next)
+      }
     }
     await update($, meta, () => ({ loadedAt: Date.now(), loading: false, error: null, signedOut: false, transient: false }))
   } catch (err) {
@@ -221,6 +284,7 @@ async function pickProject($: EngineInterface, cfg: Config, slug: string | null)
   await update($, activeProject, () => slug)
   await update($, view, () => 'tasks')
   await update($, notice, () => null)
+  await resetRequests($)
   await load($, cfg)
 }
 
@@ -267,7 +331,7 @@ export const register: Register = (on, options) => {
     // Input is on the terminal/desktop tables but not every surface's; take it loosely
     // and guard its use, so the pane still renders where it's absent.
     const Input = (resolved as unknown as { Input?: any }).Input
-    const [current, taskRows, traceRows, m, openId, draftText, note, active, projectRows, sum, newProj] = await Promise.all([
+    const [current, taskRows, traceRows, m, openId, draftText, note, active, projectRows, sum, newProj, filter, cursor, startAt] = await Promise.all([
       read($, view),
       read($, tasks),
       read($, traces),
@@ -279,6 +343,9 @@ export const register: Register = (on, options) => {
       read($, projects),
       read($, summary),
       read($, newProject),
+      read($, requestFilter),
+      read($, traceCursor),
+      read($, requestStart),
     ])
     const height = Math.max(6, e.props?.scroll?.bodyRows ?? e.viewport?.rows ?? 20)
     const cols = Math.max(24, e.props?.bodyColumns ?? e.viewport?.columns ?? 80)
@@ -381,24 +448,56 @@ export const register: Register = (on, options) => {
       )
     }
 
+    // Which calls to list, as chips: the active one orange, the rest dim.
+    const filterChips = () => (
+      <Box gap={1}>
+        <Text dimColor>Show</Text>
+        {(['all', 'traffic', 'shadow'] as RequestFilter[]).map(f => (
+          <Button key={`filter-${f}`} plain onPress={() => void setFilter($, cfg, f)}>
+            {f === filter ? <Text bold color={ORANGE}>[{f}]</Text> : <Text dimColor>{f}</Text>}
+          </Button>
+        ))}
+      </Box>
+    )
+
     const requestsList = () => {
-      if (traceRows.length === 0) return <Text dimColor>{m.loading ? 'Loading…' : 'No recent calls.'}</Text>
+      if (traceRows.length === 0) {
+        return (
+          <Box flexDirection="column">
+            {filterChips()}
+            <Text dimColor>{m.loading ? 'Loading…' : filter === 'shadow' ? 'No silent-test calls found.' : 'No recent calls.'}</Text>
+          </Box>
+        )
+      }
       const barW = 7
       const nameW = Math.max(12, cols - 9 - barW - 1 - 7 - 4 - 3)
-      const maxMs = Math.max(1, ...traceRows.map(r => r.ms ?? 0))
       const head = `${padR('TIME', 9)}${padR('ANSWERED BY', nameW)}${padR('LATENCY', barW + 1 + 7)}${padL('ST', 4)}`
+      // Chips, column heads and the pager take three rows; the calls get the rest.
+      const visible = Math.max(1, bodyRows - 3)
+      const start = Math.min(startAt, Math.max(0, traceRows.length - 1))
+      const shown = traceRows.slice(start, start + visible)
+      const maxMs = Math.max(1, ...shown.map(r => r.ms ?? 0))
+      const older = async () => {
+        // Near the end of what is loaded, fetch the next page first.
+        if (start + 2 * visible > traceRows.length && cursor) await loadMore($, cfg)
+        const total = (await read($, traces)).length
+        if (start + visible < total) await update($, requestStart, () => start + visible)
+      }
+      const hasOlder = start + visible < traceRows.length || cursor !== null
       return (
         <Box flexDirection="column">
+          {filterChips()}
           <Text dimColor bold>
             {head}
           </Text>
-          {traceRows.slice(0, bodyRows - 2).map((r, i) => {
+          {shown.map((r, i) => {
             const adapter = /vllm|qwen|adapter/i.test(r.answeredBy)
             const emoji = r.rating === 'up' ? '👍' : r.rating === 'down' ? '👎' : '  '
+            const who = `${r.purpose === 'shadow' ? '◆ ' : ''}${r.answeredBy || r.purpose}`
             return (
-              <Button key={`row-${r.id || i}`} plain onPress={() => void update($, openTrace, () => r.id)}>
+              <Button key={`row-${r.id || start + i}`} plain onPress={() => void update($, openTrace, () => r.id)}>
                 <Text dimColor>{padR(r.time, 9)}</Text>
-                <Text color={adapter ? ORANGE : undefined}>{padR(r.answeredBy || r.purpose, nameW)}</Text>
+                <Text color={adapter ? ORANGE : undefined}>{padR(who, nameW)}</Text>
                 {dottedBar(((r.ms ?? 0) / maxMs) * 100, barW, adapter ? ORANGE : MUTED)}
                 <Text dimColor> {padL(r.ms === null ? '' : `${r.ms}ms`, 7)}</Text>
                 <Text color={r.status === 200 ? GREEN : r.status ? RED : undefined}> {padL(String(r.status ?? ''), 3)}</Text>
@@ -406,7 +505,21 @@ export const register: Register = (on, options) => {
               </Button>
             )
           })}
-          {traceRows.length > bodyRows - 2 && <Text dimColor>  +{traceRows.length - (bodyRows - 2)} more</Text>}
+          <Box gap={2}>
+            <Text dimColor>
+              {start + 1}–{start + shown.length} of {traceRows.length}{cursor ? '+' : ''}
+            </Text>
+            {start > 0 && (
+              <Button key="newer" plain onPress={() => void update($, requestStart, () => Math.max(0, start - visible))}>
+                <Text color={ORANGE}>‹ Newer</Text>
+              </Button>
+            )}
+            {hasOlder && (
+              <Button key="older" plain onPress={() => void older()}>
+                <Text color={ORANGE}>Older ›</Text>
+              </Button>
+            )}
+          </Box>
         </Box>
       )
     }

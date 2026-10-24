@@ -1,5 +1,8 @@
 export type View = 'tasks' | 'requests' | 'projects'
 
+// Which calls the Requests view lists: every call, client calls only, or silent-test calls.
+export type RequestFilter = 'all' | 'traffic' | 'shadow'
+
 export type Shadow = { passes: number; pairs: number; rate: number; need: number }
 
 export type TaskRow = {
@@ -65,6 +68,10 @@ declare module 'claude-code' {
       projects: Shaped<ProjectRow[]>
       summary: Shaped<Summary>
       newProject: Shaped<string> // the new-project name being typed
+      requestFilter: Shaped<RequestFilter>
+      traceCursor: Shaped<string | null> // the CLI's cursor for the next page of calls; null = no more
+      tracePages: Shaped<number> // pages of calls loaded beyond a refresh's first one, plus one
+      requestStart: Shaped<number> // first loaded call the Requests view shows
     }
   }
 }
