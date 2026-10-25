@@ -44,7 +44,7 @@ function readConfig(options: unknown): Config {
     command: o.command?.trim() || 'mubit',
     project: o.project?.trim() || '',
     refreshSeconds: Math.max(10, Number(o.refreshSeconds) || 60),
-    requestLimit: Math.max(1, Math.min(100, Number(o.requestLimit) || 15)),
+    requestLimit: Math.max(1, Math.min(100, Number(o.requestLimit) || 20)),
   }
 }
 
@@ -348,7 +348,8 @@ export const register: Register = (on, options) => {
       read($, requestStart),
     ])
     const height = Math.max(6, e.props?.scroll?.bodyRows ?? e.viewport?.rows ?? 20)
-    const cols = Math.max(24, e.props?.bodyColumns ?? e.viewport?.columns ?? 80)
+    // Every view sits inside a one-column margin on each side; `cols` is the width within it.
+    const cols = Math.max(24, (e.props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2)
     const bodyRows = Math.max(1, height - 4) // title, rule, content, rule, footer => 4 chrome rows
 
     const clip = (s: string, n: number) => (n <= 1 ? '' : s.length > n ? `${s.slice(0, n - 1)}…` : s)
@@ -463,7 +464,7 @@ export const register: Register = (on, options) => {
     const requestsList = () => {
       if (traceRows.length === 0) {
         return (
-          <Box flexDirection="column">
+          <Box flexDirection="column" gap={1}>
             {filterChips()}
             <Text dimColor>{m.loading ? 'Loading…' : filter === 'shadow' ? 'No silent-test calls found.' : 'No recent calls.'}</Text>
           </Box>
@@ -472,8 +473,9 @@ export const register: Register = (on, options) => {
       const barW = 7
       const nameW = Math.max(12, cols - 9 - barW - 1 - 7 - 4 - 3)
       const head = `${padR('TIME', 9)}${padR('ANSWERED BY', nameW)}${padR('LATENCY', barW + 1 + 7)}${padL('ST', 4)}`
-      // Chips, column heads and the pager take three rows; the calls get the rest.
-      const visible = Math.max(1, bodyRows - 3)
+      // Chips, column heads, the pager and the blank rows around the table take five
+      // rows; the calls get the rest.
+      const visible = Math.max(1, bodyRows - 5)
       const start = Math.min(startAt, Math.max(0, traceRows.length - 1))
       const shown = traceRows.slice(start, start + visible)
       const maxMs = Math.max(1, ...shown.map(r => r.ms ?? 0))
@@ -484,27 +486,30 @@ export const register: Register = (on, options) => {
         if (start + visible < total) await update($, requestStart, () => start + visible)
       }
       const hasOlder = start + visible < traceRows.length || cursor !== null
+      // A blank row after the chips and before the pager, as the Projects view spaces its list.
       return (
-        <Box flexDirection="column">
+        <Box flexDirection="column" gap={1}>
           {filterChips()}
-          <Text dimColor bold>
-            {head}
-          </Text>
-          {shown.map((r, i) => {
-            const adapter = /vllm|qwen|adapter/i.test(r.answeredBy)
-            const emoji = r.rating === 'up' ? '👍' : r.rating === 'down' ? '👎' : '  '
-            const who = `${r.purpose === 'shadow' ? '◆ ' : ''}${r.answeredBy || r.purpose}`
-            return (
-              <Button key={`row-${r.id || start + i}`} plain onPress={() => void update($, openTrace, () => r.id)}>
-                <Text dimColor>{padR(r.time, 9)}</Text>
-                <Text color={adapter ? ORANGE : undefined}>{padR(who, nameW)}</Text>
-                {dottedBar(((r.ms ?? 0) / maxMs) * 100, barW, adapter ? ORANGE : MUTED)}
-                <Text dimColor> {padL(r.ms === null ? '' : `${r.ms}ms`, 7)}</Text>
-                <Text color={r.status === 200 ? GREEN : r.status ? RED : undefined}> {padL(String(r.status ?? ''), 3)}</Text>
-                <Text> {emoji}</Text>
-              </Button>
-            )
-          })}
+          <Box flexDirection="column">
+            <Text dimColor bold>
+              {head}
+            </Text>
+            {shown.map((r, i) => {
+              const adapter = /vllm|qwen|adapter/i.test(r.answeredBy)
+              const emoji = r.rating === 'up' ? '👍' : r.rating === 'down' ? '👎' : '  '
+              const who = `${r.purpose === 'shadow' ? '◆ ' : ''}${r.answeredBy || r.purpose}`
+              return (
+                <Button key={`row-${r.id || start + i}`} plain onPress={() => void update($, openTrace, () => r.id)}>
+                  <Text dimColor>{padR(r.time, 9)}</Text>
+                  <Text color={adapter ? ORANGE : undefined}>{padR(who, nameW)}</Text>
+                  {dottedBar(((r.ms ?? 0) / maxMs) * 100, barW, adapter ? ORANGE : MUTED)}
+                  <Text dimColor> {padL(r.ms === null ? '' : `${r.ms}ms`, 7)}</Text>
+                  <Text color={r.status === 200 ? GREEN : r.status ? RED : undefined}> {padL(String(r.status ?? ''), 3)}</Text>
+                  <Text> {emoji}</Text>
+                </Button>
+              )
+            })}
+          </Box>
           <Box gap={2}>
             <Text dimColor>
               {start + 1}–{start + shown.length} of {traceRows.length}{cursor ? '+' : ''}
@@ -665,7 +670,7 @@ export const register: Register = (on, options) => {
       )
 
     return (
-      <Box flexDirection="column" height={height}>
+      <Box flexDirection="column" height={height} paddingX={1}>
         <Box justifyContent="space-between">
           <Text>
             <Text bold color={ORANGE}>◈ MUBIT</Text>
@@ -679,7 +684,8 @@ export const register: Register = (on, options) => {
           {body()}
         </Box>
 
-        {/* Controls: tab selection on the left; Refresh and when it last ran on the right. */}
+        {/* Controls: tab selection on the left; Refresh pinned right, when it last ran just
+            before it, so the changing time never moves the button. */}
         <Text dimColor>{'─'.repeat(cols)}</Text>
         <Box justifyContent="space-between">
           <Box gap={2}>
@@ -688,10 +694,10 @@ export const register: Register = (on, options) => {
             {tab('projects', 'Projects')}
           </Box>
           <Box gap={1}>
+            {freshness() && <Text dimColor>{freshness()} ·</Text>}
             <Button key="refresh" plain onPress={() => void load($, cfg)}>
               <Text dimColor>↻ Refresh</Text>
             </Button>
-            {freshness() && <Text dimColor>· {freshness()}</Text>}
           </Box>
         </Box>
       </Box>

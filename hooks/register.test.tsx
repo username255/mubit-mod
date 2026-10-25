@@ -182,7 +182,7 @@ test('the shadow filter lists silent-test calls only', async ($, on) => {
   await ui.press({ key: 'filter-shadow' })
 
   const traces = seen.filter(a => a.includes('traces')).at(-1) ?? []
-  expect(traces.join(' ')).toBe('mubit traces --limit 15 --json --with-cursor --purpose shadow')
+  expect(traces.join(' ')).toBe('mubit traces --limit 20 --json --with-cursor --purpose shadow')
   expect(await ui.find({ type: 'Text', text: /◆ vllm Qwen/ })).toBeDefined()
   await ui.unmount()
 })

@@ -47,7 +47,7 @@ Loads are tolerant of a brief `503` from the engine (one retry, last-good data k
 | `command` | `mubit` | The CLI command (name on PATH or an absolute path) |
 | `project` | (console's current) | Project slug to show |
 | `refreshSeconds` | `60` | How often to refresh |
-| `requestLimit` | `15` | How many recent calls the Requests view loads |
+| `requestLimit` | `20` | How many recent calls the Requests view loads |
 
 ## Develop
 

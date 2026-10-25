@@ -24,7 +24,7 @@
     },
     "requestLimit": {
       "type": "number",
-      "default": 15,
+      "default": 20,
       "description": "How many recent calls the Requests view loads",
       "title": "Requests to load"
     }
