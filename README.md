@@ -18,15 +18,25 @@ Link it onto your PATH as `mubit`, or set the mod's `command` option to its abso
 
 ## Install
 
-In Claude Code:
+Straight from GitHub, in Claude Code (v2.1.287 or later):
 
 ```
-/plugin marketplace add username255/mubit-mod
-/plugin install mubit@mubit-mod
+/plugin install mubit --marketplace username255/mubit-mod
 ```
 
-Set its options with `claude plugin configure mubit@mubit-mod`. Open the pane with
-`/mubit-ui` (it also opens on its own on a wide terminal).
+Or from your shell:
+
+```sh
+claude plugin install mubit --marketplace username255/mubit-mod
+```
+
+Either one adds this repository as the `mubit-mod` marketplace and installs the mod from it.
+Append `#v0.1.0` to the source to pin a release. Update with
+`claude plugin update mubit@mubit-mod`, and set options with
+`claude plugin configure mubit@mubit-mod`. To try it for one session without installing,
+clone the repository and run `claude --plugin-dir ./mubit-mod`.
+
+Open the pane with `/mubit-ui` (it also opens on its own on a wide terminal).
 
 ## What it shows
 
