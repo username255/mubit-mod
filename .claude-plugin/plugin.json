@@ -1,7 +1,12 @@
 {
   "name": "mubit",
   "version": "0.1.0",
-  "description": "A pane of Mubit task stats, with an optional Requests view, from the mubit CLI",
+  "description": "A pane of Mubit task stats, with a drill-in Requests view and feedback, from the mubit CLI",
+  "author": {
+    "name": "username255"
+  },
+  "homepage": "https://github.com/username255/mubit-mod",
+  "repository": "https://github.com/username255/mubit-mod",
   "types": "./types/index.d.ts",
   "userConfig": {
     "command": {

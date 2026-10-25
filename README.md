@@ -7,19 +7,26 @@ live data through the `mubit` CLI and refreshes on a timer.
 
 ![pane](docs/pane.png)
 
+*An earlier version of the pane, before the Projects tab; the views are described below.*
+
 ## Requires
 
-The [`mubit` CLI](https://github.com/username255/mubit-cli) on your PATH, signed in
-(`mubit login`). The mod runs it for every refresh. Set a different command or
-project in the mod's config if needed.
+The `mubit` CLI, signed in with `mubit login`. The mod runs it for every refresh.
+[mubit-hack-26](https://github.com/username255/mubit-hack-26) ships it for macOS Apple
+Silicon as `bin/mubit-darwin-arm64` ([usage](https://github.com/username255/mubit-hack-26/blob/main/docs/cli.md)).
+Link it onto your PATH as `mubit`, or set the mod's `command` option to its absolute path.
 
 ## Install
 
+In Claude Code:
+
 ```
-/plugin install mubit --marketplace username255/mubit-mod
+/plugin marketplace add username255/mubit-mod
+/plugin install mubit@mubit-mod
 ```
 
-Then open the pane with `/mubit-ui` (it also opens on its own on a wide terminal).
+Set its options with `claude plugin configure mubit@mubit-mod`. Open the pane with
+`/mubit-ui` (it also opens on its own on a wide terminal).
 
 ## What it shows
 
@@ -57,3 +64,7 @@ git clone https://github.com/username255/mubit-mod.git
 claude plugin validate mubit-mod
 claude plugin test mubit-mod
 ```
+
+## License
+
+[MIT](LICENSE)
