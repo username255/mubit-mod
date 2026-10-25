@@ -89,6 +89,23 @@ test('tasks view shows stats and the shadow meter', async ($, on) => {
   await ui.unmount()
 })
 
+test('a task with no graded pairs says so instead of a 0% meter', async ($, on) => {
+  const ungraded = JSON.stringify([{ ...JSON.parse(TASKS)[0], live: { passes: 0, pairs: 0, rate: null, bar: 0.8 } }])
+  on('command.register', () => ({ value: { command: 'mubit' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('process.run', (_: unknown, e: { argv: readonly string[] }) => ({
+    value: { exitCode: 0, stdout: e.argv.includes('tasks') ? ungraded : stdoutFor(e.argv), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'refresh' })
+
+  expect(await ui.find({ type: 'Text', text: /no graded pairs yet/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /shadow 0\/0/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('projects view lists projects and switches the active one', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })

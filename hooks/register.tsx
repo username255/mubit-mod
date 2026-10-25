@@ -387,6 +387,8 @@ export const register: Register = (on, options) => {
 
     const minPairs = sum?.minPairs ?? 50
     const shadowBlock = (s: Shadow) => {
+      // Nothing graded yet reads as a 0% meter, which looks like failing; say so instead.
+      if (s.pairs === 0) return <Text dimColor>shadow · no graded pairs yet</Text>
       const ok = s.rate >= s.need
       const c = ok ? GREEN : ORANGE
       return (
