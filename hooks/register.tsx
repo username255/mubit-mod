@@ -11,6 +11,7 @@ const PANE = 'mubit'
 const ORANGE = '#E8835A'
 const GREEN = '#6FBF73'
 const RED = '#E0564C'
+const SOFT_RED = '#B0544C' // a down rating: duller than RED, since it isn't an error
 const AMBER = '#D9A441'
 const MUTED = '#7d7d7d' // a neutral fill for bars that aren't the accent
 const INK = '#14110f' // text that sits on an orange fill
@@ -295,7 +296,7 @@ async function rate($: EngineInterface, cfg: Config, id: string, rating: 'up' | 
   const res = (await $.process.run([cfg.command, ...args], { timeoutMs: 25_000 })) as RunResult
   if (res.exitCode === 0) {
     await update($, draft, () => '')
-    await update($, notice, () => ({ text: `Saved 👍/👎 ${rating}.`, kind: 'ok' }))
+    await update($, notice, () => ({ text: `Saved: rated ${rating}.`, kind: 'ok' }))
     await load($, cfg)
   } else {
     const message = firstLine(res.stderr) || firstLine(res.stdout) || `rate exited ${res.exitCode}`
@@ -407,6 +408,10 @@ export const register: Register = (on, options) => {
           ? { g: '◆', c: ORANGE }
           : { g: '·', c: undefined }
 
+    // A rating as a triangle that takes colour (an emoji can't): green up, soft red down.
+    const ratingStyle = (rating: string): { g: string; c?: string } =>
+      rating === 'up' ? { g: '▲', c: GREEN } : rating === 'down' ? { g: '▼', c: SOFT_RED } : { g: ' ', c: undefined }
+
     const tasksView = () => {
       if (taskRows.length === 0) return <Text dimColor>{m.loading ? 'Loading…' : 'No tasks yet.'}</Text>
       const shadowCount = taskRows.filter(t => t.shadow).length
@@ -496,7 +501,7 @@ export const register: Register = (on, options) => {
             </Text>
             {shown.map((r, i) => {
               const adapter = /vllm|qwen|adapter/i.test(r.answeredBy)
-              const emoji = r.rating === 'up' ? '👍' : r.rating === 'down' ? '👎' : '  '
+              const mark = ratingStyle(r.rating)
               const who = `${r.purpose === 'shadow' ? '◆ ' : ''}${r.answeredBy || r.purpose}`
               return (
                 <Button key={`row-${r.id || start + i}`} plain onPress={() => void update($, openTrace, () => r.id)}>
@@ -505,7 +510,7 @@ export const register: Register = (on, options) => {
                   {dottedBar(((r.ms ?? 0) / maxMs) * 100, barW, adapter ? ORANGE : MUTED)}
                   <Text dimColor> {padL(r.ms === null ? '' : `${r.ms}ms`, 7)}</Text>
                   <Text color={r.status === 200 ? GREEN : r.status ? RED : undefined}> {padL(String(r.status ?? ''), 3)}</Text>
-                  <Text> {emoji}</Text>
+                  <Text color={mark.c}> {mark.g}</Text>
                 </Button>
               )
             })}
@@ -553,7 +558,7 @@ export const register: Register = (on, options) => {
               <Text dimColor bold>FEEDBACK</Text>
               {r.fb.slice(-3).map((f, i) => (
                 <Text key={String(i)}>
-                  {f.rating === 'up' ? '👍' : '👎'} <Text dimColor>{clip(f.comment || '(no note)', w - 12)} · {f.source}</Text>
+                  <Text color={ratingStyle(f.rating).c}>{ratingStyle(f.rating).g}</Text> <Text dimColor>{clip(f.comment || '(no note)', w - 12)} · {f.source}</Text>
                 </Text>
               ))}
             </Box>
@@ -578,10 +583,10 @@ export const register: Register = (on, options) => {
           )}
           <Box gap={2}>
             <Button key="up" plain onPress={() => void rate($, cfg, r.id, 'up', draftText)}>
-              <Text color={GREEN}>👍 Rate up</Text>
+              <Text color={GREEN}>▲ Rate up</Text>
             </Button>
             <Button key="down" plain onPress={() => void rate($, cfg, r.id, 'down', draftText)}>
-              <Text color={RED}>👎 Rate down</Text>
+              <Text color={SOFT_RED}>▼ Rate down</Text>
             </Button>
           </Box>
         </Box>

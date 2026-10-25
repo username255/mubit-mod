@@ -108,6 +108,7 @@ test('a request opens its detail and shows existing feedback', async ($, on) => 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'requests' })
+  expect(await ui.find({ type: 'Text', text: /▲/ })).toBeDefined() // the call's up rating
   await ui.press({ key: 'row-trc_fb' })
 
   expect(await ui.find({ type: 'Text', text: /Is 52418 odd or even/ })).toBeDefined()
